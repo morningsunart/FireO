@@ -50,7 +50,12 @@ setup(
         # Specify the Python versions you support here. In particular, ensure
         # that you indicate whether you support Python 2, Python 3 or both.
         "Programming Language :: Python",
-        "Programming Language :: Python :: 3.7"
+        "Programming Language :: Python :: 3.9",
+        "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
+        "Programming Language :: Python :: 3.13",
+        "Programming Language :: Python :: 3.14",
     ],
 
     # What does your project relate to?
@@ -65,5 +70,13 @@ setup(
     # your project is installed. For an analysis of "install_requires" vs pip's
     # requirements files see:
     # https://packaging.python.org/en/latest/requirements.html
-    install_requires=['google-cloud-firestore==2.2.0'],
+    python_requires=">=3.9",
+
+    install_requires=[
+        'google-cloud-firestore==2.27.0',
+        'google-cloud-logging==3.15.0',
+        'google-api-core==2.30.3',
+        'protobuf==6.33.6',
+        'grpcio==1.80.0',
+    ],
 )
