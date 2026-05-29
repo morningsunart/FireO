@@ -1,23 +1,10 @@
-from functools import wraps
-from typing import Any, Dict, Generic, Iterator, List, Optional, overload, Type, TYPE_CHECKING, TypeVar, Union
+import base64
+import json
 
-from google.cloud.firestore_v1 import DocumentReference, Transaction, WriteBatch
-
-from fireo.queries.query_set import QuerySet
-from fireo.utils.cursor import Cursor
-from fireo.utils.utils import get_key, is_key
-
-if TYPE_CHECKING:
-    from fireo.queries.filter_query import FilterQuery
-    from fireo.models import Model
-
-    try:
-        from typing import Self
-    except ImportError:
-        try:
-            from typing_extensions import Self
-        except ImportError:
-            Self = Any
+from fireo.managers.errors import EmptyDocument
+from fireo.fields import NestedModel
+from fireo.fields.errors import FieldNotFound
+from fireo.queries import query_set as queries
 
 
 class ManagerError(Exception):
@@ -42,45 +29,7 @@ class ManagerDescriptor:
         return self.manager
 
 
-def _convert_key_or_id_to_key(func):
-    @wraps(func)
-    def wrapper(self, *args, **kwargs):
-        if 'id' in kwargs:
-            kwargs['key'] = self.get_key_by_id(kwargs.pop('id'))
-        elif 'key' in kwargs:
-            pass
-        elif args:
-            arg = args[0]
-            if not is_key(arg):
-                args = (self.get_key_by_id(arg),) + args[1:]
-
-        return func(self, *args, **kwargs)
-
-    return wrapper
-
-
-def _convert_key_or_id_list_to_keys_list(func):
-    @wraps(func)
-    def wrapper(self, *args, **kwargs):
-        if 'id_list' in kwargs:
-            kwargs['key_list'] = [self.get_key_by_id(id_) for id_ in kwargs.pop('id_list')]
-        elif 'key_list' in kwargs:
-            pass
-        elif args:
-            key_or_id_list = args[0]
-            if key_or_id_list:
-                if not is_key(key_or_id_list[0]):
-                    args = ([self.get_key_by_id(id_) for id_ in key_or_id_list],) + args[1:]
-
-        return func(self, *args, **kwargs)
-
-    return wrapper
-
-
-ModelType = TypeVar('ModelType', bound='Model')
-
-
-class Manager(Generic[ModelType]):
+class Manager:
     """Manager are used to perform firestore action directly from model class without instance
 
     Default manager can be accessible via `collection` from model class
@@ -173,20 +122,10 @@ class Manager(Generic[ModelType]):
         End document at this key or at that matching fields
     """
 
-    def __init__(self, *, model_cls=None, name=None, parent_key=None):
-        self.model_cls = model_cls
-        self.name = name
-        self._parent_key = parent_key
-
-    def _deconstruct(self) -> Dict[str, Any]:
-        return {
-            "model_cls": self.model_cls,
-            "name": self.name,
-            "parent_key": self._parent_key,
-        }
-
-    def copy(self, **kwargs) -> "Manager":
-        return type(self)(**{**self._deconstruct(), **kwargs})
+    def __init__(self):
+        self.model_cls = None
+        self.name = None
+        self._parent_key = None
 
     def contribute_to_model(self, model_cls, name="collection"):
         """Attach manager to model class
@@ -207,13 +146,11 @@ class Manager(Generic[ModelType]):
         setattr(model_cls, name, ManagerDescriptor(self))
 
     @property
-    def queryset(self) -> QuerySet:
+    def queryset(self):
         """provide operations related to firestore"""
-        return QuerySet(self.model_cls)
+        return queries.QuerySet(self.model_cls)
 
-    def create(
-        self, mutable_instance=None, transaction=None, batch=None, merge=None, no_return=False, **kwargs
-    ) -> Optional[ModelType]:
+    def create(self, mutable_instance=None, transaction=None, batch=None, merge=None, no_return=False, **kwargs,):
         """create new document in firestore collection
 
         Parameters
@@ -228,34 +165,75 @@ class Manager(Generic[ModelType]):
         batch:
             Firestore batch
         """
-        if self._parent_key:
-            kwargs['parent'] = self._parent_key
+        _EMPTY_DOC_EXCEPTION = "Empty document can not be save, Add at least one field value"
+        # Check if it empty document then don't save it
+        if not kwargs:
+            raise EmptyDocument(_EMPTY_DOC_EXCEPTION)
 
-        return self.queryset.create(mutable_instance, transaction, batch, merge, no_return, **kwargs)
+        # Check if of the field value is not None
+        is_none_dict = True
+        for k, v in kwargs.items():
+            try:
+                f = self.model_cls._meta.get_field(k)
+                default_value = f.field_attribute.default
+                if v is not None or default_value is not None:
+                    is_none_dict = False
+                    break
+            except FieldNotFound:
+                if v is not None or default_value is not None:
+                    is_none_dict = False
+                    break
 
-    @overload
-    def update(
-        self,
-        key: Optional[str] = None,
-        mutable_instance: Optional[ModelType] = None,
-        transaction: Optional[Transaction] = None,
-        batch: Optional[WriteBatch] = None,
-        no_return: bool = False,
-        **kwargs
-    ) -> Optional[Union[ModelType, DocumentReference]]:
-        ...
+        if is_none_dict:
+            raise EmptyDocument(_EMPTY_DOC_EXCEPTION)
 
-    @_convert_key_or_id_to_key
-    def update(
-        self, key=None, mutable_instance=None, transaction=None, batch=None, no_return=False, **kwargs
-    ) -> Optional[Union[ModelType, DocumentReference]]:
+        field_list = {}
+        # if mutable instance is none this mean user is creating document directly from manager
+        # For example User.collection.create(name="Azeem") in this case mutable instance will be None
+        # If document is creating by directly using manager then check if there is any NestedModel
+        # If there is any nested model then get get value from nested model
+        if mutable_instance is None:
+            for k, v in kwargs.items():
+                try:
+                    # if this is an id field then save it in field list and pass it
+                    f = self.model_cls._meta.get_field(k)
+                except FieldNotFound:
+                    field_list[k] = v
+                    continue
+                if isinstance(f, NestedModel):
+                    model_instance = v
+                    if f.valid_model(model_instance):
+                        field_list[f.name] = model_instance._get_fields()
+                else:
+                    field_list[k] = v
+            # Create instance for nested model
+            for f in self.model_cls._meta.field_list.values():
+                if isinstance(f, NestedModel):
+                    field_list[f.name] = f.nested_model()._get_fields()
+        else:
+            field_list = kwargs
+
+        # If this model has custom IDField then
+        # Check if field list length is one(1) and field is IDField
+        # if this one field is IDField then this is also Empty Document
+        # which can not save
+        if self.model_cls._meta.id is not None:
+            if len(field_list) == 1:
+                # getting first key name from dict
+                first_key_name = next(iter(field_list))
+                id_name, _ = self.model_cls._meta.id
+
+                # Check first key is id
+                if first_key_name == id_name:
+                    raise EmptyDocument(_EMPTY_DOC_EXCEPTION)
+
+        return self.queryset.create(mutable_instance, transaction, batch, merge, no_return, **field_list)
+
+    def _update(self, mutable_instance=None, transaction=None, batch=None, **kwargs):
         """Update existing document in firestore collection
 
         Parameters
         ---------
-        key: str
-            Key of the document. If key is not provided then mutable_instance is required
-
         mutable_instance: Model instance
             Make changes in existing model instance After performing firestore action modified this instance
             adding things init like id, key etc
@@ -265,54 +243,22 @@ class Manager(Generic[ModelType]):
 
         batch:
             Firestore batch
-
-        no_return:
-            If True, then updated document will not be fetched from firestore
-
-        **kwargs:
-            Extra fields to be updated
         """
-        assert key or mutable_instance, "Either key or mutable_instance is required"
-        assert not key or is_key(key), "Key is not valid"
+        return self.queryset.update(mutable_instance, transaction, batch, **kwargs)
 
-        return self.queryset.update(key, mutable_instance, transaction, batch, no_return, **kwargs)
-
-    @overload
-    def get(self, key: str, transaction: Optional[Transaction] = None) -> Optional[ModelType]:
-        ...
-
-    @overload
-    def get(self, id: str, transaction: Optional[Transaction] = None) -> Optional[ModelType]:
-        ...
-
-    @_convert_key_or_id_to_key
-    def get(self, key: str, transaction: Optional[Transaction] = None) -> Optional[ModelType]:
+    def get(self, key, transaction=None):
         """Get document from firestore"""
-        assert is_key(key), "Key is not valid"
-
         return self.queryset.get(key, transaction)
 
-    @overload
-    def get_all(self, key_list: List[str]) -> Iterator[Optional[ModelType]]:
-        ...
-
-    @overload
-    def get_all(self, id_list: List[str]) -> Iterator[Optional[ModelType]]:
-        ...
-
-    @_convert_key_or_id_list_to_keys_list
-    def get_all(self, key_list: List[str]) -> Iterator[Optional[ModelType]]:
+    def get_all(self, key_list):
         """Get All documents according to key list"""
         for key in key_list:
             yield self.queryset.get(key)
 
-    def refresh(self, mutable_instance: ModelType, transaction=None) -> None:
-        """Refresh document from firestore"""
-        self.queryset.get(mutable_instance.key, transaction, mutable_instance)
-
-    def parent(self, key: str) -> "Self":
+    def parent(self, key):
         """Parent collection"""
-        return self.copy(parent_key=key)
+        self._parent_key = key
+        return self
 
     def filter(self, *args, **kwargs):
         """Get filter document from firestore"""
@@ -329,11 +275,11 @@ class Manager(Generic[ModelType]):
         instead of from a single collection."""
         return self.queryset.filter(self._parent_key).group_fetch(limit)
 
-    def transaction(self, t: Transaction):
+    def transaction(self, t):
         """Firestore transaction"""
         return self.queryset.filter(self._parent_key).transaction(t)
 
-    def batch(self, b: WriteBatch):
+    def batch(self, b):
         """Firestore batch"""
         return self.queryset.filter(self._parent_key).batch(b)
 
@@ -349,64 +295,46 @@ class Manager(Generic[ModelType]):
         """Order the document by field name"""
         return self.queryset.filter(self._parent_key).order(field_name)
 
-    @overload
-    def delete(
-        self,
-        key: str,
-        transaction: Optional[Transaction] = None,
-        batch: Optional[WriteBatch] = None,
-        child: bool = False
-    ) -> None:
-        ...
-
-    @overload
-    def delete(
-        self,
-        id: str,
-        transaction: Optional[Transaction] = None,
-        batch: Optional[WriteBatch] = None,
-        child: bool = False
-    ) -> None:
-        ...
-
-    @_convert_key_or_id_to_key
-    def delete(
-        self,
-        key: str,
-        transaction: Optional[Transaction] = None,
-        batch: Optional[WriteBatch] = None,
-        child: bool = False
-    ) -> None:
+    def delete(self, key=None, transaction=None, batch=None, child=False):
         """Delete document from firestore
 
         if child is True then delete child collection and documents also
         """
-        self.queryset.delete(key, transaction, batch, child=child)
+        if key:
+            self.queryset.delete(key, transaction, batch, child=child)
+        else:
+            self.queryset.filter(self._parent_key).delete(child=child)
 
-    @overload
-    def delete_all(self, key_list: List[str], batch: Optional[WriteBatch] = None, child: bool = False) -> None:
-        ...
-
-    @overload
-    def delete_all(self, id_list: List[str], batch: Optional[WriteBatch] = None, child: bool = False) -> None:
-        ...
-
-    @_convert_key_or_id_list_to_keys_list
-    def delete_all(self, key_list: List[str], batch: Optional[WriteBatch] = None, child: bool = False) -> None:
+    def delete_all(self, key_list, batch=None, child=False):
         """Delete all documents according to given keys"""
         for key in key_list:
             self.queryset.delete(key, batch=batch, child=child)
-
-    def delete_every(self, child: bool = False) -> None:
-        """Delete every document from the collection"""
-        self.queryset.filter(self._parent_key).delete(child=child)
 
     def cursor(self, cursor):
         """Start query from specific point
 
         Cursor define where to start the query
         """
-        return Cursor.from_string(cursor).apply(self._parent_key, self.queryset)
+        parent = self._parent_key
+        cursor_dict = json.loads(base64.b64decode(cursor))
+        if 'parent' in cursor_dict:
+            parent = cursor_dict['parent']
+        query = self.queryset.filter(parent)
+        if 'filters' in cursor_dict:
+            for filter in cursor_dict['filters']:
+                query.filter(*filter)
+        if 'order' in cursor_dict:
+            query.order(cursor_dict['order'])
+        if 'limit' in cursor_dict:
+            query.limit(cursor_dict['limit'])
+
+        # check if last doc key is available or not
+        if 'last_doc_key' in cursor_dict:
+            query.start_after(key=cursor_dict['last_doc_key'])
+        else:
+            query.offset(cursor_dict['offset'])
+
+        return query
 
     def start_after(self, key=None, **kwargs):
         """Start document after this key or after that matching fields"""
@@ -423,9 +351,3 @@ class Manager(Generic[ModelType]):
     def end_at(self, key=None, **kwargs):
         """End document at this key or at that matching fields"""
         return self.queryset.filter(self._parent_key).end_at(key, **kwargs)
-
-    def get_key_by_id(self, id: str) -> str:
-        """Get document key by id"""
-        # return self.queryset.get_key_by_id(id)
-        self.model_cls: Type[Model]
-        return get_key(self.model_cls.collection_name, id, self._parent_key)

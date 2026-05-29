@@ -1,13 +1,7 @@
-from typing import Optional, Type, TYPE_CHECKING
-
+from fireo.fields import DateTime, NestedModel
 from fireo.queries import query_wrapper
 from fireo.queries.base_query import BaseQuery
 from fireo.utils import utils
-from fireo.utils.types import DumpOptions
-from fireo.utils.utils import get_flat_dict
-
-if TYPE_CHECKING:
-    from fireo.models import Model
 
 
 class UpdateQuery(BaseQuery):
@@ -27,38 +21,11 @@ class UpdateQuery(BaseQuery):
     exec(transaction_or_batch):
         return modified instance of model
     """
-
-    def __init__(
-        self,
-        model_cls: 'Type[Model]',
-        mutable_instance: 'Optional[Model]' = None,
-        no_return: bool = False,
-        key: Optional[str] = None,
-        values: Optional[dict] = None,
-    ):
+    def __init__(self, model_cls, mutable_instance=None, **kwargs):
         super().__init__(model_cls)
-        assert mutable_instance is None or isinstance(mutable_instance, model_cls), (
-            'mutable_instance must be instance of model_cls'
-        )
-        assert mutable_instance is not None or key is not None, (
-            'mutable_instance or key is required'
-        )
-
+        self.query = kwargs
         self.model = mutable_instance
-        if self.model is None:
-            self.model = model_cls()
-
-        if key is not None:
-            self.model.key = key
-
-        if values is not None:
-            # Use direct assignment to assign values in internal representation
-            # E.g.: Models in case of NestedModelField
-            for k, v in values.items():
-                setattr(self.model, k, v)
-
-        self.no_return = no_return
-        super().set_collection_path(key=self.model.key)
+        super().set_collection_path(key=mutable_instance.key)
 
     def _doc_ref(self):
         """create document ref from firestore"""
@@ -80,40 +47,49 @@ class UpdateQuery(BaseQuery):
         in this case it will be like this
         `{full_name: "Azeem", age=25}`
         """
-        field_dict = self.model.to_db_dict(dump_options=DumpOptions(
-            ignore_required=True,
-            ignore_default=True,
-            ignore_unchanged=True,
-        ))
+        field_dict = {}
+        for f in self.model._meta.field_list.values():
+            if f.name in self.query:
+                # Check if it is nested model
+                if isinstance(f, NestedModel):
+                    # Get nested model field
+                    self._nested_field_list(f, field_dict, f.name)
+                else:
+                    v = f.get_value(self.query.get(f.name), ignore_required=True, ignore_default=True)
+                    if v is not None or type(v) is bool:
+                        field_dict[f.db_column_name] = v
+                    if v is None and isinstance(f, DateTime):
+                        field_dict[f.db_column_name] = v
+        return field_dict
 
-        # Convert to dot notated fields update objects without replacing
-        flat_field_dict = get_flat_dict(field_dict)
-
-        return flat_field_dict
+    def _nested_field_list(self, f, fl, *name):
+        """Get Nested Fields"""
+        nested_field_list = {}
+        for n_f in f.nested_model._meta.field_list.values():
+            if isinstance(n_f, NestedModel):
+                n = (*name, n_f.name)
+                self._nested_field_list(n_f, nested_field_list, *n)
+            else:
+                nested_field_list[n_f.db_column_name] = n_f.get_value(
+                    utils.get_nested(self.query, *name).get(n_f.name),
+                    ignore_required=True
+                )
+        fl[f.db_column_name] = nested_field_list
 
     def _raw_exec(self, transaction_or_batch=None):
         """Update document in firestore and return the document"""
         ref = self._doc_ref()
-        self.model._id = ref.id
-        values = self._parse_field()
-
-        if transaction_or_batch is not None:
-            if values:
-                transaction_or_batch.update(ref, values)
+        if transaction_or_batch:
+            transaction_or_batch.update(ref, self._parse_field())
             return ref
 
-        if values:
-            ref.update(values)
-
-        self.model._reset_field_changed()
-
-        if self.no_return:
-            return None
-
-        return ref.get()
+        parse_field = self._parse_field()
+        if parse_field:
+            ref.update(parse_field)
+            return ref.get()
 
     def exec(self, transaction_or_batch=None):
         """return modified instance of model"""
-        if transaction_or_batch is not None:
+        if transaction_or_batch:
             return self._raw_exec(transaction_or_batch)
         return query_wrapper.ModelWrapper.from_query_result(self.model, self._raw_exec())

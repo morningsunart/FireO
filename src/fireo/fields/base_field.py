@@ -1,5 +1,4 @@
 from fireo.fields.field_attribute import FieldAttribute
-from fireo.utils.types import DumpOptions, LoadOptions
 
 
 class MetaField(type):
@@ -99,7 +98,7 @@ class Field(metaclass=MetaField):
         """
         return self.raw_attributes.get("column_name") or self.name
 
-    def get_value(self, val, dump_options=DumpOptions()):
+    def get_value(self, val, ignore_required=False, ignore_default=False):
         """Get field value after validation
 
         Make validation and applying attribute function on it.
@@ -110,18 +109,17 @@ class Field(metaclass=MetaField):
         val : Any
             Field value
 
-        dump_options : DumpOptions
-            Options for dumping to Firestore dictionary
+        ignore_required : Bool
+            Ignore required fields or not mostly ignore when updating the document
+
+        ignore_default : Bool
+            Ignore default fields or not mostly ignore when updating the document
 
         Returns
         -------
             DB value
         """
-        val = self.field_attribute.parse(
-            val,
-            dump_options.ignore_required,
-            dump_options.ignore_default,
-        )
+        val = self.field_attribute.parse(val, ignore_required, ignore_default)
         return self.db_value(val)
 
     def db_value(self, val):
@@ -159,7 +157,7 @@ class Field(metaclass=MetaField):
                 return val.lower() if type(val) is str else val
         return val
 
-    def field_value(self, val, load_options=LoadOptions()):
+    def field_value(self, val):
         """ How this field represent value that is coming from firestore
 
         Value can be modified after getting value from firestore
@@ -168,7 +166,7 @@ class Field(metaclass=MetaField):
         -------
             .. code-block:: python
                 class BoolField(Field):
-                    def field_value(self, val, model):
+                    def field_value(self, val):
                         if val == 1:
                             return True
                         else:
@@ -185,9 +183,5 @@ class Field(metaclass=MetaField):
         ------
             val:
                 Modified value
-            model:
-                Model instance
-            initial:
-                Is it initial value or not
         """
         return val

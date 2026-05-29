@@ -1,7 +1,3 @@
-from copy import copy
-
-from google.cloud.firestore_v1.transforms import Sentinel
-
 from fireo.fields.errors import *
 
 
@@ -24,10 +20,7 @@ class FieldAttribute:
         In firestore this fields will be store as **full_name**
 
     default:
-        if no value is defined then default value is set for field
-
-    default_factory:
-        if no value is defined then default_factory is called to value set for field
+        if no value is define then default value is set for field
 
     required:
         Required field if no value or default set raise an Error
@@ -63,7 +56,7 @@ class FieldAttribute:
     AttributeMethodNotDefined:
         if any custom field not define the method for `allowed_attributes`
     """
-    allowed_attributes = ['default', 'default_factory', 'required', 'column_name', 'validator', 'validator_kwargs']
+    allowed_attributes = ['default', 'required', 'column_name', 'validator', 'validator_kwargs']
 
     def __init__(self, field, attributes):
         self.field = field
@@ -85,18 +78,12 @@ class FieldAttribute:
                 return value
 
             # check default value if set for field
-            if value is None and not ignore_default:
-                if self.default is not None:
-                    value = self.default
-                    if not isinstance(self.default, Sentinel):
-                        value = copy(self.default)
-
-                elif self.default_factory is not None:
-                    value = self.default_factory()
+            if self.default is not None and value is None and not ignore_default:
+                value = self.default
 
             # check this field is required or not
             if self.required and value is None and not ignore_required:
-                raise RequiredField(f'"{self.field.name}" is required for model {self.field.model_cls} '
+                raise RequiredField(f'"{self.field.__class__.__name__}" is required for model {self.field.model_cls} '
                                     f'but received no default and no value.')
 
             # check if there any custom validation provided by user
@@ -199,7 +186,7 @@ class FieldAttribute:
 
         try:
             # call attribute method from field
-            return getattr(self.field, "attr_" + attr)(self.field_attr(attr), value)
+            return getattr(self.field, "attr_"+attr)(self.field_attr(attr), value)
         except AttributeError as e:
             raise AttributeMethodNotDefined(f'Method is not defined for attribute "{attr}" '
                                             f'in field "{self.field.__class__.__name__}"') from e
@@ -212,11 +199,6 @@ class FieldAttribute:
     def default(self):
         """if no value is define then default value is set for field"""
         return self.attributes.get('default')
-
-    @property
-    def default_factory(self):
-        """if no value is define then default value is set for field"""
-        return self.attributes.get('default_factory')
 
     @property
     def required(self):

@@ -1,29 +1,9 @@
-import warnings
-from itertools import chain
-from typing import Any, TYPE_CHECKING
-
-from google.cloud.firestore_v1 import DocumentSnapshot
-
-import fireo.fields as fields
-from fireo.database import db
-from fireo.fields.errors import RequiredField
+from fireo import fields
 from fireo.managers.managers import Manager
-from fireo.models.errors import AbstractNotInstantiate, ModelSerializingWrappedError
+from fireo.models.errors import AbstractNotInstantiate
 from fireo.models.model_meta import ModelMeta
 from fireo.queries.errors import InvalidKey
 from fireo.utils import utils
-from fireo.utils.types import DumpOptions, LoadOptions
-
-if TYPE_CHECKING:
-    from fireo.fields import Field
-
-    try:
-        from typing import Self
-    except ImportError:
-        try:
-            from typing_extensions import Self
-        except ImportError:
-            Self = Any
 
 
 class Model(metaclass=ModelMeta):
@@ -66,6 +46,9 @@ class Model(metaclass=ModelMeta):
     key : str
         Model key which contain the model collection name and model id and parent if provided, Id can be user defined
         or generated from firestore
+
+    _update_doc: str
+        Update doc hold the key which is used to update the document
 
     parent: str
         Parent key if user specify
@@ -123,38 +106,30 @@ class Model(metaclass=ModelMeta):
     _meta = None
 
     # This is for manager
-    collection: 'Manager[Self]' = None
+    collection: Manager = None
 
     # Collection name for this model
     collection_name = None
 
     # Track which fields are changed or not
     # it is useful when updating document
-    _field_changed = None
+    _field_list = []
+    _field_changed = []
 
-    _create_time = None
-    _update_time = None
+    # check instance is modified or not
+    # When you get the document from firestore or
+    # save the document then the model instance changed
+    # This also give the help to track update fields
+    _instance_modified = False
 
-    class Meta:
-        abstract = True
+    # Update doc hold the key which is used to update the document
+    _update_doc = None
 
-    def __init__(self, *args, parent: str = "", **kwargs):
-        self.parent = parent
-        if args:
-            raise AttributeError('You must use keyword arguments when instantiating a model')
-        unexpected_kwargs = set(kwargs) - set(self._meta.field_list)
-        if unexpected_kwargs:
-            raise AttributeError(
-                'You passed in unknown keyword arguments: {}'.format(', '.join(unexpected_kwargs))
-            )
-
+    def __init__(self, *args, **kwargs):
         # check this is not abstract model otherwise stop creating instance of this model
         if self._meta.abstract:
             raise AbstractNotInstantiate(
                 f'Can not instantiate abstract model "{self.__class__.__name__}"')
-
-        self._field_changed = set()
-        self._extra_fields = set()
 
         # Allow users to set fields values direct from the constructor method
         for k, v in kwargs.items():
@@ -163,152 +138,35 @@ class Model(metaclass=ModelMeta):
         # Create instance for nested model
         # for direct assignment to nested model
         for f in self._meta.field_list.values():
-            if isinstance(f, fields.NestedModelField):
-                if f.name not in kwargs:
-                    if f.raw_attributes.get('required', False):
-                        setattr(self, f.name, f.nested_model())
-                elif isinstance(kwargs[f.name], dict):
-                    warnings.warn(
-                        'Use Model.from_dict to deserialize from dict',
-                        DeprecationWarning
-                    )
-                    setattr(self, f.name, f.nested_model.from_dict(kwargs[f.name]))
+            if isinstance(f, fields.NestedModel):
+                if f.name in kwargs:
+                    setattr(self, f.name, f.nested_model.from_dict(
+                        kwargs[f.name]))
+                else:
+                    setattr(self, f.name, f.nested_model())
 
     @classmethod
-    def from_dict(cls, model_dict, by_column_name=False):
+    def from_dict(cls, model_dict):
         """Instantiate model from dict"""
         if model_dict is None:
             return None
+        return cls(**model_dict)
 
-        instance = cls()
-        instance.populate_from_doc_dict(model_dict, by_column_name=by_column_name)
-        return instance
-
-    def merge_with_dict(self, model_dict, by_column_name=False):
-        """Load data from dict into model."""
-        self.populate_from_doc_dict(model_dict, merge=True, by_column_name=by_column_name)
-
-    def to_dict(
-        self,
-        include_id: bool = True,
-        include_key: bool = True,
-        include_parent: bool = False,
-        dump_options=DumpOptions(use_column_name=False)
-    ):
+    def to_dict(self):
         """Convert model into dict"""
-        model_dict = self.to_db_dict(dump_options)
-
-        if include_id:
-            id_field_name, _ = self._meta.id
-            model_dict[id_field_name] = utils.get_id(self.key)
-
-        if include_key:
-            model_dict['key'] = self.key
-
-        if include_parent:
-            model_dict['parent'] = self.parent
-
+        model_dict = self._get_fields()
+        id = 'id'
+        if self._meta.id is not None:
+            id, _ = self._meta.id
+        model_dict[id] = utils.get_id(self.key)
+        model_dict['key'] = self.key
         return model_dict
-
-    def to_db_dict(self, dump_options=DumpOptions()):
-        from fireo.fields import IDField
-
-        result = {}
-        for field in self._meta.field_list.values():
-            field: Field  # type: ignore
-
-            if isinstance(field, IDField):
-                if not field.include_in_document:
-                    # do not include ID field to dict for firestore unless it is explicitly set
-                    continue
-
-            field_changed = self._is_field_unchanged(field.name)
-            if dump_options.ignore_unchanged and not field_changed:
-                continue
-
-            try:
-                nested_field_value = getattr(self, field.name)
-                value = field.get_value(nested_field_value, dump_options)
-            except Exception as error:
-                path = (field.name,)
-                raise ModelSerializingWrappedError(self, path, error) from error
-
-            if (
-                value is not None or
-                not dump_options.ignore_default_none or
-                field_changed
-            ):
-                if dump_options.use_column_name:
-                    result[field.db_column_name] = value
-                else:
-                    result[field.name] = value
-
-        return result
-
-    def populate_from_doc(self, doc: DocumentSnapshot) -> None:
-        """Populate model from firestore document."""
-        doc_dict = doc and doc.to_dict() or {}
-        self.populate_from_doc_dict(doc_dict, stored=True, by_column_name=True)
-
-        self.key = doc.reference.path
-        self._reset_field_changed()  # Remove 'id' from _field_changed
-        self._create_time = doc.create_time
-        self._update_time = doc.update_time
-
-    def populate_from_doc_dict(self, doc_dict: dict, stored=False, merge=False, by_column_name=False):
-        """Populate model from Firestore document dict."""
-        if not merge:
-            old_extra_fields = set(self._extra_fields) - set(self._meta.field_list)
-            for extra_field in old_extra_fields:
-                delattr(self, extra_field)
-            self._extra_fields = set()
-
-        new_extra_fields_names = set(doc_dict) - set(self._meta.field_list)
-        if new_extra_fields_names and not by_column_name:
-            raise NotImplementedError(
-                f"Can't populate model from dict with unknown fields: {new_extra_fields_names}"
-            )
-
-        new_extra_fields = [
-            self._meta.get_field_by_column_name(field_name)
-            for field_name in new_extra_fields_names
-            # get_field_by_column_name returns None if extra fields are ignored
-            if self._meta.get_field_by_column_name(field_name) is not None
-        ]
-
-        for field in chain(self._meta.field_list.values(), new_extra_fields):
-            field_name_in_dict = field.db_column_name if by_column_name else field.name
-            raw_value = doc_dict.get(field_name_in_dict)
-
-            has_value = getattr(self, field.name, None) is not None
-            if field_name_in_dict in doc_dict or has_value and not merge:
-                # Set value from doc_dict
-                # or reset value if merge is False and field has value
-                value = field.field_value(raw_value, LoadOptions(
-                    model=self,
-                    stored=stored,
-                    merge=merge,
-                    by_column_name=by_column_name,
-                ))
-
-                if stored:
-                    self._set_orig_attr(field.name, value)
-                else:
-                    setattr(self, field.name, value)
-
-        if not merge and stored:
-            # If all fields where replaced by stored values
-            # then there are no changed fields
-            self._reset_field_changed()
-
-    def _reset_field_changed(self):
-        self._field_changed = set()
 
     # Get all the fields values from meta
     # which are attached with this mode
-    # to create or update the document
+    # and convert them into corresponding db value
     # return dict {name: value}
-    def _get_fields(self, ignore_unchanged=False, ignore_default_none=False):
+    def _get_fields(self):
         """Get Model fields and values
 
         Retrieve all fields which are attached with Model from `_meta`
@@ -337,13 +195,12 @@ class Model(metaclass=ModelMeta):
         """
         field_list = {}
         for f in self._meta.field_list.values():
-            v = getattr(self, f.name)
-            field_changed = self._is_field_unchanged(f.name)
-            if (
-                (not ignore_unchanged or field_changed) and
-                (not ignore_default_none or field_changed or v is not None)
-            ):
-                field_list[f.name] = v
+            if isinstance(f, fields.NestedModel):
+                model_instance = getattr(self, f.name)
+                if f.valid_model(model_instance):
+                    field_list[f.name] = model_instance._get_fields()
+            else:
+                field_list[f.name] = getattr(self, f.name)
         return field_list
 
     @property
@@ -370,13 +227,10 @@ class Model(metaclass=ModelMeta):
         id : str or None
             User defined id or None
         """
+        if self._meta.id is None:
+            return None
         name, field = self._meta.id
-        raw_value = getattr(self, name)
-        value = field.get_value(raw_value)
-        if raw_value is None and value is not None:
-            setattr(self, name, value)
-
-        return value
+        return field.get_value(getattr(self, name))
 
     @_id.setter
     def _id(self, doc_id):
@@ -403,8 +257,10 @@ class Model(metaclass=ModelMeta):
         doc_id : str
             Id of the model user specified or auto generated from firestore
         """
-        id_field_name, _ = self._meta.id
-        setattr(self, id_field_name, doc_id)
+        id = 'id'
+        if self._meta.id is not None:
+            id, _ = self._meta.id
+        setattr(self, id, doc_id)
         # Doc id can be None when user create Model directly from manager
         # For Example:
         #   User.collection.create(name="Azeem")
@@ -418,19 +274,12 @@ class Model(metaclass=ModelMeta):
             return self._key
         try:
             k = '/'.join([self.parent, self.collection_name, self._id])
-        except (TypeError, RequiredField):
+        except TypeError:
             k = '/'.join([self.parent, self.collection_name, '@temp_doc_id'])
         if k[0] == '/':
             return k[1:]
         else:
             return k
-
-    @key.setter
-    def key(self, key: str) -> None:
-        collection = key.split('/')[-2]
-        assert collection == self.collection_name, 'Collection name does not match'
-        self.parent = utils.get_parent_doc(key)
-        self._id = utils.get_id(key)
 
     def _set_key(self, doc_id):
         """Set key for model"""
@@ -447,7 +296,7 @@ class Model(metaclass=ModelMeta):
             :class:`google.api_core.datetime_helpers.DatetimeWithNanoseconds`,
             :class:`datetime.datetime` or ``NoneType``:
         """
-        return self._create_time
+        return self._meta._firestore_create_time
 
     def get_firestore_update_time(self):
         """returns update time of document in Firestore
@@ -456,11 +305,12 @@ class Model(metaclass=ModelMeta):
             :class:`google.api_core.datetime_helpers.DatetimeWithNanoseconds`,
             :class:`datetime.datetime` or ``NoneType``:
         """
-        return self._update_time
+        return self._meta._firestore_update_time
 
     def list_subcollections(self):
         """return a list of any subcollections of the doc"""
-        return [c.id for c in self.document_reference().collections()]
+        if self._meta._referenceDoc is not None:
+            return [c.id for c in self._meta._referenceDoc.collections()]
 
     def save(self, transaction=None, batch=None, merge=None, no_return=False):
         """Save Model in firestore collection
@@ -493,13 +343,7 @@ class Model(metaclass=ModelMeta):
         """
         # pass the model instance if want change in it after save, fetch etc operations
         # otherwise it will return new model instance
-        return self.__class__.collection.create(
-            self,
-            transaction,
-            batch,
-            merge,
-            no_return,
-        )
+        return self.__class__.collection.create(self, transaction, batch, merge, no_return, **self._get_fields())
 
     def upsert(self, transaction=None, batch=None):
         """If the document does not exist, it will be created. 
@@ -544,78 +388,51 @@ class Model(metaclass=ModelMeta):
         """
 
         # Check doc key is given or not
-        if not key:
-            key = self.key
+        if key:
+            self._update_doc = key
 
         # make sure update doc in not None
-        if key is not None and '@temp_doc_id' not in key:
+        if self._update_doc is not None and '@temp_doc_id' not in self._update_doc:
             # set parent doc from this updated document key
-            self.parent = utils.get_parent_doc(key)
+            self.parent = utils.get_parent_doc(self._update_doc)
             # Get id from key and set it for model
-            self._id = utils.get_id(key)
-        elif key is None and '@temp_doc_id' in self.key:
+            setattr(self, '_id', utils.get_id(self._update_doc))
+            # Add the temp id field if user is not specified any
+            if self._id is None and self.id:
+                setattr(self._meta, 'id', ('id', fields.IDField()))
+        elif self._update_doc is None and '@temp_doc_id' in self.key:
             raise InvalidKey(
                 f'Invalid key to update model "{self.__class__.__name__}" ')
 
+        # Get the updated fields
+        updated_fields = {}
+        for k, v in self._get_fields().items():
+            if k in self._field_changed:
+                updated_fields[k] = v
+            # Get nested fields if any
+            # Nested model store as dict in firestore so check values type is dict
+            if type(v) is dict:
+                # nested field name and value
+                for name, value in v.items():
+                    if name in self._field_changed:
+                        # create the name with parent field name and child name
+                        # For example:
+                        #   class User(Model):
+                        #       address = TextField()
+                        #   class Student(Model):
+                        #       age = NumberField()
+                        #       user = NestedModel(User)
+                        #
+                        # Then the field name for nested model will be "user.address"
+                        updated_fields[k+"."+name] = value
         # pass the model instance if want change in it after save, fetch etc operations
         # otherwise it will return new model instance
-        return self.__class__.collection.update(
-            mutable_instance=self,
-            transaction=transaction,
-            batch=batch,
-        )
-
-    def refresh(self, transaction=None):
-        """Refresh the model from firestore"""
-        if self.key is None:
-            raise ValueError('Model must have key to refresh')
-
-        return self.__class__.collection.refresh(self, transaction=transaction)
+        return self.__class__.collection._update(self, transaction=transaction, batch=batch, **updated_fields)
 
     def __setattr__(self, key, value):
         """Keep track which filed values are changed"""
-        if key in self._meta.field_list:
-            self._field_changed.add(key)
+        if key in self._field_list or not self._instance_modified:
+            self._field_changed.append(key)
+        else:
+            self._field_list.append(key)
         super(Model, self).__setattr__(key, value)
-
-    def _set_orig_attr(self, key, value):
-        """Keep track which filed values are changed"""
-        if key != '_id' and key not in self._meta.field_list:
-            self._extra_fields.add(key)
-        super(Model, self).__setattr__(key, value)
-
-    @property
-    def document_path(self):
-        doc_path = self.collection_name + '/' + self._id
-        if self.parent:
-            doc_path = self.parent + '/' + doc_path
-
-        return doc_path
-
-    def document_reference(self):
-        return db.conn.document(self.document_path)
-
-    def _is_field_unchanged(self, field_name: str) -> bool:
-        """Check if field has changed if possible.
-
-        Return True if field has not changed, False if it has changed, or it is not possible to determine.
-        """
-        if field_name in self._field_changed:
-            return True
-
-        field = self._meta.field_list[field_name]
-        value = getattr(self, field_name)
-        if value is not None:
-            if isinstance(field, (
-                fields.MapField,
-                fields.ListField,
-                fields.NestedModelField,
-            )):
-                # Is unchanged check is not implemented for these field types yet
-                return True
-
-        if isinstance(field, fields.DateTime) and field.raw_attributes.get('auto_update', False):
-            # Auto update fields are always considered changed
-            return True
-
-        return False

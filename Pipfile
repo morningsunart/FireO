@@ -5,7 +5,6 @@ verify_ssl = true
 
 [dev-packages]
 pytest = "*"
-typing-extensions = "*"
 
 [packages]
 fireo = {path = ".",editable = true}

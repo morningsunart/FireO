@@ -1,11 +1,8 @@
 from fireo.database import db
 from fireo.fields import errors
 from fireo.fields.base_field import Field
-from fireo.queries.query_wrapper import ReferenceDocLoader
 from fireo.utils import utils
 from google.cloud import firestore
-
-from fireo.utils.types import LoadOptions
 
 
 class ReferenceField(Field):
@@ -58,36 +55,21 @@ class ReferenceField(Field):
         self.on_load = None
 
     # Override method
-    def field_value(self, val, load_options=LoadOptions()):
-        ref = self.field_attribute.parse(val)
-
-        if not ref:
-            return None
-
-        ref_doc = ReferenceDocLoader(load_options.model, self, ref)
-
-        if self.auto_load:
-            return ref_doc.get()
-
-        return ref_doc
+    def field_value(self, val):
+        v = self.field_attribute.parse(val)
+        return v
 
     # Override method
     def db_value(self, model):
         # if no model is provided then return None
         if model is None:
             return None
-
-        # if model is string then return document reference
-        # Used for filtering by key instead of model
-        if isinstance(model, str):
-            return db.conn.document(model)
-
         # check reference model and passing model is same
         if not issubclass(model.__class__, self.model_ref):
             raise errors.ReferenceTypeError(f'Invalid reference type. Field "{self.name}" required value type '
                                             f'"{self.model_ref.__name__}", but got "{model.__class__.__name__}"')
         # Get document reference from firestore
-        return db.conn.document(model.key)
+        return firestore.DocumentReference(*utils.ref_path(model.key), client=db.conn)
 
     def attr_auto_load(self, attr_val, field_val):
         """Attribute method for auto load
