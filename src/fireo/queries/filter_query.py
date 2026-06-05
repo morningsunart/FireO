@@ -221,7 +221,7 @@ class FilterQuery(BaseQuery):
         ref = self.get_ref()
         # parse where filter
         for f in self.parse_where():
-            ref = ref.where(*f)
+            ref = ref.where(filter=firestore.FieldFilter(*f))
         # Apply limit
         if self.n_limit:
             ref = ref.limit(self.n_limit)
